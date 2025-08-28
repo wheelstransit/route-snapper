@@ -1,0 +1,8 @@
+[package]
+name = "route-snapper"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+geo = { version = "0.26", features = ["proj"] }
+geo-types = "0.7"
