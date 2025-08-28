@@ -6,7 +6,7 @@ description = "A Rust library to accurately project an ordered list of stops ont
 license = "MIT"
 repository = "https://github.com/anscg/route-snapper"
 readme = "README.md"
-keywords = ["geo", "gis", "route", "snapping", "gps"]
+keywords = ["geo", "gis", "gps", "transit", "bus"]
 categories = ["algorithms", "science::geo"]
 
 [dependencies]
