@@ -1,36 +1,33 @@
 //! A Rust library to accurately project an ordered list of stops onto a route line,
 //! intelligently handling cases where the route overlaps itself.
 //!
-//! The core of this library is a dynamic programming algorithm that finds the
-//! globally optimal snapping for a sequence of stops, avoiding the pitfalls of a
-//! simple "find closest point" approach.
+//! This library uses a high-performance greedy algorithm accelerated by a spatial
+//! index (R-tree). This approach is significantly faster than dynamic programming for
+//! large routes, while still correctly handling complex overlap scenarios.
 //!
 //! # Algorithm Overview
 //!
-//! 1.  **Generate Candidate Projections:** For each stop, find all plausible projection
-//!     points on the route line by identifying local minima in the distance function.
-//!     This correctly finds candidates on both outbound and inbound segments in
-//!     overlapping sections.
+//! 1.  **Build Spatial Index:** An R-tree is built from the bounding boxes of all
+//!     line segments of the route. This allows for near-instantaneous querying of
+//!     geographically nearby segments. This is a one-time setup cost.
 //!
-//! 2.  **Define a Cost Function:** Calculate the "cost" of traveling between a
-//!     candidate projection for `Stop i` and a candidate for `Stop i+1`. This cost
-//!     balances projection accuracy (distance from stop to line) and path plausibility
-//!     (detour factor).
-//!
-//! 3.  **Find Minimum Cost Path:** Use dynamic programming to find the sequence of
-//!     candidates that minimizes the total accumulated cost from the first to the
-//!     last stop.
-//!
-//! 4.  **Backtrack and Return:** Reconstruct the optimal path to produce the final
-//!     ordered list of `ProjectedStop`s.
+//! 2.  **Sequential Greedy Projection:** Stops are processed in their given order.
+//!     For each stop:
+//!     a. **Query Index:** The R-tree is queried to find a small set of the
+//!        **nearest candidate segments** to the stop's location.
+//!     b. **Local Projection:** The stop is projected onto only these candidate
+//!        segments to find precise candidate points on the line.
+//!     c. **Disambiguation:** From all candidates that are *forward* of the previous
+//!        stop, the one with the **smallest projection error** (most geographically
+//!        plausible) is chosen.
 //!
 //! # Example Usage
 //!
-//! ```rust,ignore
-//! fn main() {
-//!     use route_snapper::{project_stops, Stop, ProjectionConfig};
-//!     use geo_types::{Coord, LineString};
+//! ```rust
+//! use route_snapper::{project_stops, Stop};
+//! use geo_types::{Coord, LineString};
 //!
+//! fn main() {
 //!     // A route that goes out and comes back on the same path (overlap)
 //!     let route_line = LineString::from(vec![
 //!         Coord { x: 0.0, y: 0.0 },   // Start
@@ -51,9 +48,9 @@
 //!
 //!     // The distance for Stop 3 should be greater than Stop 2's distance,
 //!     // demonstrating the overlap was handled correctly.
-//!     assert!(results[0].distance_along_route < 100.0); // Around 99.0
-//!     assert!(results[1].distance_along_route > 199.0); // Around 200.0
-//!     assert!(results[2].distance_along_route > results[1].distance_along_route); // Should be around 300.0
+//!     assert!((results[0].distance_along_route - 99.0).abs() < 1e-9);
+//!     assert!((results[1].distance_along_route - 200.0).abs() < 1e-9);
+//!     assert!((results[2].distance_along_route - 299.0).abs() < 1e-9);
 //!     
 //!     println!("Successfully projected stops:");
 //!     for stop in results {
@@ -66,7 +63,8 @@
 //! ```
 
 use geo::prelude::*;
-use geo_types::{Coord, LineString, Point};
+use geo_types::{Coord, Line, LineString, Point};
+use rstar::{RTree, AABB};
 
 /// Represents a single bus stop with a unique identifier and location.
 #[derive(Debug, Clone)]
@@ -91,19 +89,13 @@ pub struct ProjectedStop {
 }
 
 /// A configuration struct for the projection algorithm.
+/// Note: With the new algorithm, this struct is currently unused but kept for API stability.
 #[derive(Debug, Clone, Copy)]
-pub struct ProjectionConfig {
-    /// A weight to balance the importance of projection error vs. detour cost.
-    /// A higher value prioritizes paths with a more direct travel distance between stops.
-    pub detour_cost_weight: f64,
-}
+pub struct ProjectionConfig {}
 
 impl Default for ProjectionConfig {
-    /// Creates a default configuration with a `detour_cost_weight` of 1.0.
     fn default() -> Self {
-        Self {
-            detour_cost_weight: 1.0,
-        }
+        Self {}
     }
 }
 
@@ -114,34 +106,33 @@ pub enum ProjectionError {
     RouteIsEmpty,
     /// The provided slice of `Stop`s is empty.
     NoStopsProvided,
-    /// The algorithm failed to find a valid projection for the stops.
-    NoPathFound,
+    /// The algorithm failed to find a valid forward projection for a stop.
+    /// This may indicate out-of-order stops or a large gap between the stop and the route.
+    NoProjectionFound,
 }
 
-/// A candidate projection for a single stop onto the route line.
+/// Internal struct to hold data for each route segment in the R-tree.
 #[derive(Debug, Clone, Copy)]
-struct Candidate {
-    /// The coordinate of the projection on the route line.
-    projected_location: Coord<f64>,
-    /// The cumulative distance from the start of the route line to the projected point.
-    distance_along_route: f64,
-    /// The geographical distance between the original location and the projected location.
-    projection_error: f64,
+struct RouteSegment {
+    line: Line<f64>,
+    cumulative_distance: f64,
 }
+
+const K_NEAREST_NEIGHBORS: usize = 10;
 
 /// The main function of the library.
 ///
 /// # Arguments
 /// * `route_line`: A `LineString` representing the full, sequential path of the bus.
 /// * `stops`: An ordered slice of `Stop`s to project onto the line.
-/// * `config`: Optional configuration for the projection algorithm.
+/// * `_config`: Optional configuration (currently unused).
 ///
 /// # Returns
 /// A `Result` containing either the ordered `Vec<ProjectedStop>` or a `ProjectionError`.
 pub fn project_stops(
     route_line: &LineString<f64>,
     stops: &[Stop],
-    config: Option<ProjectionConfig>,
+    _config: Option<ProjectionConfig>,
 ) -> Result<Vec<ProjectedStop>, ProjectionError> {
     if route_line.0.len() < 2 {
         return Err(ProjectionError::RouteIsEmpty);
@@ -150,9 +141,71 @@ pub fn project_stops(
         return Err(ProjectionError::NoStopsProvided);
     }
 
-    let config = config.unwrap_or_default();
+    // 1. Pre-computation: Build R-tree from route segments
+    let rtree = build_rtree(route_line);
 
-    // Pre-calculate cumulative distances along the route
+    // 2. Sequential Greedy Projection
+    let mut projected_stops = Vec::with_capacity(stops.len());
+    let mut last_distance_along_route = 0.0;
+
+    for stop in stops {
+        let stop_point = Point::from(stop.location);
+
+        let search_point = [stop.location.x, stop.location.y];
+        let candidate_segments = rtree.nearest_neighbor_iter(&search_point).take(K_NEAREST_NEIGHBORS);
+
+        let mut best_candidate: Option<ProjectedStop> = None;
+
+        for segment in candidate_segments {
+            // Perform precise projection onto the candidate segment
+            let closest_pt = segment.line.closest_point(&stop_point);
+            let (projected_point, projected_location) = match closest_pt {
+                geo::Closest::Intersection(p) | geo::Closest::SinglePoint(p) => (p, p.into()),
+                geo::Closest::Indeterminate => continue,
+            };
+
+            let dist_on_segment = Point(segment.line.start).euclidean_distance(&projected_point);
+            let distance_along_route = segment.cumulative_distance + dist_on_segment;
+
+            // **Disambiguation:** Check if this projection is a valid forward move
+            if distance_along_route >= last_distance_along_route {
+                let projection_error = stop_point.euclidean_distance(&projected_point);
+
+                let current_candidate = ProjectedStop {
+                    id: stop.id.clone(),
+                    original_location: stop.location,
+                    projected_location,
+                    distance_along_route,
+                    projection_error,
+                };
+
+                // **THE FIX IS HERE**
+                // From the valid forward candidates, choose the one with the smallest
+                // projection error (the one that is geographically closest).
+                if let Some(best) = &best_candidate {
+                    if current_candidate.projection_error < best.projection_error {
+                        best_candidate = Some(current_candidate);
+                    }
+                } else {
+                    best_candidate = Some(current_candidate);
+                }
+            }
+        }
+
+        if let Some(winner) = best_candidate {
+            last_distance_along_route = winner.distance_along_route;
+            projected_stops.push(winner);
+        } else {
+            // If no valid forward projection was found, it's an error.
+            return Err(ProjectionError::NoProjectionFound);
+        }
+    }
+
+    Ok(projected_stops)
+}
+
+/// Builds the R-tree and calculates cumulative distances.
+fn build_rtree(route_line: &LineString<f64>) -> RTree<RouteSegment> {
     let cumulative_distances: Vec<f64> = std::iter::once(0.0)
         .chain(route_line.lines().scan(0.0, |state, line| {
             *state += Point(line.start).euclidean_distance(&Point(line.end));
@@ -160,171 +213,45 @@ pub fn project_stops(
         }))
         .collect();
 
-    // 1. Generate candidate projections for each stop
-    let all_candidates: Vec<Vec<Candidate>> = stops
-        .iter()
-        .map(|stop| find_candidate_projections(stop, route_line, &cumulative_distances))
-        .collect();
-
-    // 2. Find the minimum cost path using dynamic programming
-    let (dp_table, final_stop_idx) =
-        build_dp_table(&all_candidates, stops, &config)?;
-
-    // 3. Backtrack to find the winning path
-    let winning_path = backtrack(&dp_table, final_stop_idx);
-
-    // 4. Construct the final result
-    let result = winning_path
-        .iter()
-        .zip(stops)
-        .zip(&all_candidates)
-        .map(
-            |(((candidate_idx, _cost), stop), candidates)| {
-                let best_candidate = candidates[*candidate_idx];
-                ProjectedStop {
-                    id: stop.id.clone(),
-                    original_location: stop.location,
-                    projected_location: best_candidate.projected_location,
-                    distance_along_route: best_candidate.distance_along_route,
-                    projection_error: best_candidate.projection_error,
-                }
-            },
-        )
-        .collect();
-
-    Ok(result)
-}
-
-/// Finds all plausible candidate projections for a stop on the route line.
-fn find_candidate_projections(
-    stop: &Stop,
-    route_line: &LineString<f64>,
-    cumulative_distances: &[f64],
-) -> Vec<Candidate> {
-    let mut candidates = Vec::new();
-    for (i, line) in route_line.lines().enumerate() {
-        let closest_pt = line.closest_point(&Point::from(stop.location));
-        let (projected_point, projected_location) = match closest_pt {
-            geo::Closest::Intersection(p) | geo::Closest::SinglePoint(p) => (p, p.into()),
-            geo::Closest::Indeterminate => continue, // Should not happen on a line
-        };
-
-        let dist_on_segment = Point(line.start).euclidean_distance(&projected_point);
-        let distance_along_route = cumulative_distances[i] + dist_on_segment;
-        let projection_error = Point(stop.location).euclidean_distance(&projected_point);
-
-        candidates.push(Candidate {
-            projected_location,
-            distance_along_route,
-            projection_error,
-        });
-    }
-    // A simple way to filter for "local minima" is to sort by projection error
-    // and take the best few. For this problem, we can be more generous and keep
-    // all candidates, letting the DP algorithm decide.
-    candidates
-}
-
-/// Builds the dynamic programming table to find the minimum cost path.
-fn build_dp_table(
-    all_candidates: &[Vec<Candidate>],
-    stops: &[Stop],
-    config: &ProjectionConfig,
-) -> Result<(Vec<Vec<(usize, f64)>>, usize), ProjectionError> {
-    let mut dp_table: Vec<Vec<(usize, f64)>> = Vec::with_capacity(stops.len());
-
-    // Initialize DP table for the first stop
-    let first_stop_costs: Vec<(usize, f64)> = all_candidates[0]
-        .iter()
-        .map(|c| (usize::MAX, c.projection_error)) // (backpointer, cost)
-        .collect();
-    dp_table.push(first_stop_costs);
-
-    // Fill the rest of the DP table
-    for i in 1..stops.len() {
-        let mut current_stop_costs = Vec::new();
-        for (_j, current_cand) in all_candidates[i].iter().enumerate() {
-            let mut min_cost = f64::INFINITY;
-            let mut backpointer = 0;
-
-            for (k, prev_cand) in all_candidates[i - 1].iter().enumerate() {
-                let prev_total_cost = dp_table[i - 1][k].1;
-                let transition_cost = calculate_transition_cost(
-                    prev_cand,
-                    current_cand,
-                    &stops[i-1],
-                    &stops[i],
-                    config,
-                );
-
-                if prev_total_cost + transition_cost < min_cost {
-                    min_cost = prev_total_cost + transition_cost;
-                    backpointer = k;
-                }
-            }
-            current_stop_costs.push((backpointer, min_cost));
-        }
-        dp_table.push(current_stop_costs);
-    }
-
-    // Find the best path at the very end
-    let final_stop_idx = dp_table
-        .last()
-        .unwrap()
-        .iter()
+    let segments: Vec<RouteSegment> = route_line
+        .lines()
         .enumerate()
-        .min_by(|a, b| a.1 .1.partial_cmp(&b.1 .1).unwrap())
-        .map(|(idx, _)| idx)
-        .ok_or(ProjectionError::NoPathFound)?;
+        .map(|(i, line)| RouteSegment {
+            line,
+            cumulative_distance: cumulative_distances[i],
+        })
+        .collect();
 
-    Ok((dp_table, final_stop_idx))
+    RTree::bulk_load(segments)
 }
 
-/// Calculates the cost of moving from one candidate to another.
-fn calculate_transition_cost(
-    prev_cand: &Candidate,
-    current_cand: &Candidate,
-    _prev_stop: &Stop,
-    _current_stop: &Stop,
-    config: &ProjectionConfig,
-) -> f64 {
-    let distance_on_route = current_cand.distance_along_route - prev_cand.distance_along_route;
+// Implement the `RTreeObject` trait for `RouteSegment`
+impl rstar::RTreeObject for RouteSegment {
+    type Envelope = AABB<[f64; 2]>;
 
-    // **Constraint:** Disallow backward travel
-    if distance_on_route <= 0.0 {
-        return f64::INFINITY;
+    fn envelope(&self) -> Self::Envelope {
+        let rect = self.line.bounding_rect();
+        AABB::from_corners(
+            [rect.min().x, rect.min().y],
+            [rect.max().x, rect.max().y],
+        )
     }
-
-    let as_crow_flies = Point(prev_cand.projected_location)
-        .euclidean_distance(&Point(current_cand.projected_location));
-
-    // **Detour Cost:** Penalize nonsensical paths
-    let detour_cost = if as_crow_flies > 0.0 {
-        (distance_on_route / as_crow_flies) - 1.0
-    } else {
-        0.0 // Avoid division by zero if points are identical
-    };
-
-    // **Total Cost:** Projection error + weighted detour cost
-    current_cand.projection_error + config.detour_cost_weight * detour_cost
 }
 
-/// Backtracks through the DP table to reconstruct the optimal path.
-fn backtrack(dp_table: &[Vec<(usize, f64)>], final_stop_idx: usize) -> Vec<(usize, f64)> {
-    let mut path = Vec::with_capacity(dp_table.len());
-    let mut current_cand_idx = final_stop_idx;
-    let final_cost = dp_table.last().unwrap()[current_cand_idx].1;
-    path.push((current_cand_idx, final_cost));
-
-    for i in (1..dp_table.len()).rev() {
-        let (backpointer, _cost) = dp_table[i][current_cand_idx];
-        current_cand_idx = backpointer;
-        let cost = dp_table[i - 1][current_cand_idx].1;
-        path.push((current_cand_idx, cost));
+// Implement `PointDistance` to allow `nearest_neighbor_iter`.
+impl rstar::PointDistance for RouteSegment {
+    fn distance_2(&self, point: &[f64; 2]) -> f64 {
+        let p = Point::new(point[0], point[1]);
+        let closest_point = self.line.closest_point(&p);
+        let distance_2 = match closest_point {
+            geo::Closest::Intersection(p_on_line) | geo::Closest::SinglePoint(p_on_line) => {
+                p.euclidean_distance(&p_on_line)
+            }
+            geo::Closest::Indeterminate => 0.0,
+        };
+        // R-star uses squared distance for performance.
+        distance_2 * distance_2
     }
-
-    path.reverse();
-    path
 }
 
 
@@ -422,7 +349,7 @@ mod tests {
             Err(ProjectionError::NoStopsProvided)
         );
     }
-    
+
     #[test]
     fn test_sharp_turn() {
         let route_line = LineString::from(vec![

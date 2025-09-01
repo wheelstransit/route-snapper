@@ -12,3 +12,4 @@ categories = ["algorithms", "science::geo"]
 [dependencies]
 geo = { version = "0.26", features = ["proj"] }
 geo-types = "0.7"
+rstar = "0.11"

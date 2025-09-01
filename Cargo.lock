@@ -509,6 +509,7 @@ version = "0.1.0"
 dependencies = [
  "geo",
  "geo-types",
+ "rstar",
 ]
 
 [[package]]
