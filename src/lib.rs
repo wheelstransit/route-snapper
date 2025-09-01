@@ -2,39 +2,56 @@
 //! intelligently handling cases where the route overlaps itself.
 //!
 //! This library uses a high-performance greedy algorithm accelerated by a spatial
-//! index (R-tree). This approach is significantly faster than dynamic programming for
-//! large routes, while still correctly handling complex overlap scenarios.
+//! index (R-tree), with the assumption that the first stop is at the start of the
+//! route line and the last stop is at the end.
 //!
 //! # Algorithm Overview
 //!
-//! 1.  **Build Spatial Index:** An R-tree is built from the line segments of the
+//! 1.  **Anchoring:** The first stop is fixed to the start of the route (`distance = 0`),
+//!     and the last stop is fixed to the end (`distance = total_route_length`).
+//!
+//! 2.  **Build Spatial Index:** An R-tree is built from the line segments of the
 //!     route for near-instantaneous querying of geographically nearby segments.
 //!
-//! 2.  **Adaptive Sequential Projection:** Stops are processed in order. For each stop:
-//!     a. **Iterative Search:** An iterator of the nearest route segments is created.
-//!        The algorithm pulls from this iterator one segment at a time.
-//!     b. **Filtering:** Each segment is tested. If a projection onto it is a
-//!        valid *forward* move from the previous stop, it's added to a pool of
-//!        candidates.
-//!     c. **Termination:** The search stops once a small number of valid forward
-//!        candidates have been found, or a safety limit is reached. This ensures
-//!        the search is fast for simple cases but robust for complex loops where
-//!        the correct segment may not be the absolute closest.
-//!     d. **Selection:** The best candidate from the pool is chosen based on the
-//!        smallest projection error (best geographic fit).
+//! 3.  **Adaptive Sequential Projection:** Intermediate stops (between the first and
+//!     last) are processed in order. For each stop, an adaptive search finds the
+//!     most plausible forward projection by choosing the geographically closest
+//!     candidate from a pool of valid forward options.
 //!
 //! # Example Usage
 //!
 //! ```rust
-//! // ... (Example usage is the same and still valid)
+//! use route_snapper::{project_stops, Stop};
+//! use geo_types::{Coord, LineString};
+//!
+//! fn main() {
+//!     let route_line = LineString::from(vec![
+//!         Coord { x: 0.0, y: 0.0 },   // Start (matches Stop "A")
+//!         Coord { x: 100.0, y: 0.0 },
+//!         Coord { x: 200.0, y: 0.0 }, // End of cul-de-sac
+//!         Coord { x: 100.0, y: 0.0 },
+//!         Coord { x: 0.0, y: 0.0 },   // End (matches Stop "D")
+//!     ]);
+//!
+//!     let stops = vec![
+//!         Stop { id: "A".to_string(), location: Coord { x: 0.0, y: 1.0 } },   // First stop
+//!         Stop { id: "B".to_string(), location: Coord { x: 99.0, y: 2.0 } },  // Intermediate
+//!         Stop { id: "C".to_string(), location: Coord { x: 101.0, y: -2.0 } }, // Intermediate (on overlap)
+//!         Stop { id: "D".to_string(), location: Coord { x: 0.0, y: -1.0 } },  // Last stop
+//!     ];
+//!
+//!     let results = project_stops(&route_line, &stops, None).unwrap();
+//!
+//!     assert!((results[0].distance_along_route - 0.0).abs() < 1e-9);    // First stop anchored
+//!     assert!((results[1].distance_along_route - 99.0).abs() < 1e-9);   // Snapped correctly
+//!     assert!((results[2].distance_along_route - 299.0).abs() < 1e-9);  // Snapped correctly on return trip
+//!     assert!((results[3].distance_along_route - 400.0).abs() < 1e-9);  // Last stop anchored
+//! }
 //! ```
 
 use geo::prelude::*;
 use geo_types::{Coord, Line, LineString, Point};
 use rstar::{RTree, AABB};
-
-// ... (Structs `Stop`, `ProjectedStop`, `ProjectionConfig`, `ProjectionError` are unchanged) ...
-// --- PASTE THE STRUCT AND ERROR DEFINITIONS FROM THE PREVIOUS VERSION HERE ---
 
 /// Represents a single bus stop with a unique identifier and location.
 #[derive(Debug, Clone)]
@@ -71,11 +88,13 @@ impl Default for ProjectionConfig {
 /// Custom error types for the library.
 #[derive(Debug, PartialEq)]
 pub enum ProjectionError {
+    /// The provided route `LineString` has fewer than two points.
     RouteIsEmpty,
+    /// The provided slice of `Stop`s is empty.
     NoStopsProvided,
+    /// The algorithm failed to find a valid forward projection for an intermediate stop.
     NoProjectionFound,
 }
-
 
 /// Internal struct to hold data for each route segment in the R-tree.
 #[derive(Debug, Clone, Copy)]
@@ -85,7 +104,6 @@ struct RouteSegment {
 }
 
 /// The number of valid forward candidates to find before stopping the search.
-/// A small number is sufficient to ensure we have a good selection to choose the best fit from.
 const CANDIDATE_POOL_SIZE: usize = 5;
 /// A safety limit to prevent infinite loops on malformed data.
 const MAX_SEGMENTS_TO_CHECK: usize = 1000;
@@ -103,77 +121,113 @@ pub fn project_stops(
         return Err(ProjectionError::NoStopsProvided);
     }
 
-    let rtree = build_rtree(route_line);
     let mut projected_stops = Vec::with_capacity(stops.len());
-    let mut last_distance_along_route = 0.0;
 
-    for stop in stops {
-        let stop_point = Point::from(stop.location);
-        let search_point = [stop.location.x, stop.location.y];
-
-        let mut valid_candidates = Vec::new();
-        let mut segments_checked = 0;
-
-        // Adaptively search nearest segments until we find a pool of valid forward candidates.
-        for segment in rtree.nearest_neighbor_iter(&search_point) {
-            segments_checked += 1;
-
-            let closest_pt = segment.line.closest_point(&stop_point);
-            let (projected_point, projected_location) = match closest_pt {
-                geo::Closest::Intersection(p) | geo::Closest::SinglePoint(p) => (p, p.into()),
-                geo::Closest::Indeterminate => continue,
-            };
-
-            let dist_on_segment = Point(segment.line.start).euclidean_distance(&projected_point);
-            let distance_along_route = segment.cumulative_distance + dist_on_segment;
-
-            // If it's a valid forward projection, add it to our pool.
-            if distance_along_route >= last_distance_along_route {
-                let projection_error = stop_point.euclidean_distance(&projected_point);
-                valid_candidates.push(ProjectedStop {
-                    id: stop.id.clone(),
-                    original_location: stop.location,
-                    projected_location,
-                    distance_along_route,
-                    projection_error,
-                });
-            }
-
-            // Stop searching once we have a decent pool of candidates or we hit the safety limit.
-            if valid_candidates.len() >= CANDIDATE_POOL_SIZE || segments_checked >= MAX_SEGMENTS_TO_CHECK {
-                break;
-            }
-        }
-
-        // From the pool of valid forward candidates, pick the one with the best geometric fit.
-        let best_candidate = valid_candidates
-            .into_iter()
-            .min_by(|a, b| a.projection_error.partial_cmp(&b.projection_error).unwrap());
-
-        if let Some(winner) = best_candidate {
-            last_distance_along_route = winner.distance_along_route;
-            projected_stops.push(winner);
-        } else {
-            // If we checked many segments and still found nothing, the data is likely invalid.
-            return Err(ProjectionError::NoProjectionFound);
-        }
+    // Handle the single-stop case (anchored to start).
+    if stops.len() == 1 {
+        let stop = &stops[0];
+        let start_coord = route_line.0[0];
+        projected_stops.push(ProjectedStop {
+            id: stop.id.clone(),
+            original_location: stop.location,
+            projected_location: start_coord,
+            distance_along_route: 0.0,
+            projection_error: Point(stop.location).euclidean_distance(&Point(start_coord)),
+        });
+        return Ok(projected_stops);
     }
 
-    Ok(projected_stops)
-}
-
-// ... (The rest of the file: `build_rtree`, trait impls, and tests are unchanged) ...
-// --- PASTE THE `build_rtree` FUNCTION, TRAIT IMPLS, AND TESTS FROM THE PREVIOUS VERSION HERE ---
-
-/// Builds the R-tree and calculates cumulative distances.
-fn build_rtree(route_line: &LineString<f64>) -> RTree<RouteSegment> {
+    // Pre-calculate cumulative distances and total length
     let cumulative_distances: Vec<f64> = std::iter::once(0.0)
         .chain(route_line.lines().scan(0.0, |state, line| {
             *state += Point(line.start).euclidean_distance(&Point(line.end));
             Some(*state)
         }))
         .collect();
+    let total_route_length = *cumulative_distances.last().unwrap();
 
+    // 1. Anchor the first stop
+    let first_stop = &stops[0];
+    let start_coord = route_line.0[0];
+    projected_stops.push(ProjectedStop {
+        id: first_stop.id.clone(),
+        original_location: first_stop.location,
+        projected_location: start_coord,
+        distance_along_route: 0.0,
+        projection_error: Point(first_stop.location).euclidean_distance(&Point(start_coord)),
+    });
+    let mut last_distance_along_route = 0.0;
+
+    // 2. Process intermediate stops, if any
+    if stops.len() > 2 {
+        let rtree = build_rtree(route_line, &cumulative_distances);
+        for stop in &stops[1..stops.len() - 1] {
+            let stop_point = Point::from(stop.location);
+            let search_point = [stop.location.x, stop.location.y];
+
+            let mut valid_candidates = Vec::new();
+            let mut segments_checked = 0;
+
+            for segment in rtree.nearest_neighbor_iter(&search_point) {
+                segments_checked += 1;
+
+                let closest_pt = segment.line.closest_point(&stop_point);
+                let (projected_point, projected_location) = match closest_pt {
+                    geo::Closest::Intersection(p) | geo::Closest::SinglePoint(p) => (p, p.into()),
+                    geo::Closest::Indeterminate => continue,
+                };
+
+                let dist_on_segment =
+                    Point(segment.line.start).euclidean_distance(&projected_point);
+                let distance_along_route = segment.cumulative_distance + dist_on_segment;
+
+                if distance_along_route >= last_distance_along_route {
+                    let projection_error = stop_point.euclidean_distance(&projected_point);
+                    valid_candidates.push(ProjectedStop {
+                        id: stop.id.clone(),
+                        original_location: stop.location,
+                        projected_location,
+                        distance_along_route,
+                        projection_error,
+                    });
+                }
+
+                if valid_candidates.len() >= CANDIDATE_POOL_SIZE
+                    || segments_checked >= MAX_SEGMENTS_TO_CHECK
+                {
+                    break;
+                }
+            }
+
+            let best_candidate = valid_candidates.into_iter().min_by(|a, b| {
+                a.projection_error.partial_cmp(&b.projection_error).unwrap()
+            });
+
+            if let Some(winner) = best_candidate {
+                last_distance_along_route = winner.distance_along_route;
+                projected_stops.push(winner);
+            } else {
+                return Err(ProjectionError::NoProjectionFound);
+            }
+        }
+    }
+
+    // 3. Anchor the last stop
+    let last_stop = stops.last().unwrap();
+    let end_coord = *route_line.0.last().unwrap();
+    projected_stops.push(ProjectedStop {
+        id: last_stop.id.clone(),
+        original_location: last_stop.location,
+        projected_location: end_coord,
+        distance_along_route: total_route_length,
+        projection_error: Point(last_stop.location).euclidean_distance(&Point(end_coord)),
+    });
+
+    Ok(projected_stops)
+}
+
+/// Builds the R-tree from pre-calculated cumulative distances.
+fn build_rtree(route_line: &LineString<f64>, cumulative_distances: &[f64]) -> RTree<RouteSegment> {
     let segments: Vec<RouteSegment> = route_line
         .lines()
         .enumerate()
@@ -191,10 +245,7 @@ impl rstar::RTreeObject for RouteSegment {
 
     fn envelope(&self) -> Self::Envelope {
         let rect = self.line.bounding_rect();
-        AABB::from_corners(
-            [rect.min().x, rect.min().y],
-            [rect.max().x, rect.max().y],
-        )
+        AABB::from_corners([rect.min().x, rect.min().y], [rect.max().x, rect.max().y])
     }
 }
 
@@ -212,7 +263,6 @@ impl rstar::PointDistance for RouteSegment {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,17 +276,37 @@ mod tests {
     }
 
     #[test]
-    fn test_simple_linear_route() {
-        let route_line = LineString::from(vec![Coord { x: 0.0, y: 0.0 }, Coord { x: 100.0, y: 0.0 }]);
-        let stops = vec![
-            make_stop("1", 25.0, 1.0),
-            make_stop("2", 75.0, -1.0),
-        ];
+    fn test_anchoring_with_two_stops() {
+        let route_line =
+            LineString::from(vec![Coord { x: 0.0, y: 0.0 }, Coord { x: 100.0, y: 0.0 }]);
+        let stops = vec![make_stop("1", 1.0, 1.0), make_stop("2", 99.0, -1.0)];
 
         let results = project_stops(&route_line, &stops, None).unwrap();
         assert_eq!(results.len(), 2);
-        assert!((results[0].distance_along_route - 25.0).abs() < 1e-9);
-        assert!((results[1].distance_along_route - 75.0).abs() < 1e-9);
+        // First stop is anchored to start
+        assert_eq!(results[0].distance_along_route, 0.0);
+        assert_eq!(results[0].projected_location, (Coord { x: 0.0, y: 0.0 }));
+        // Last stop is anchored to end
+        assert_eq!(results[1].distance_along_route, 100.0);
+        assert_eq!(results[1].projected_location, (Coord { x: 100.0, y: 0.0 }));
+    }
+
+    #[test]
+    fn test_simple_linear_route_with_intermediate() {
+        let route_line =
+            LineString::from(vec![Coord { x: 0.0, y: 0.0 }, Coord { x: 100.0, y: 0.0 }]);
+        let stops = vec![
+            make_stop("start", 0.0, 1.0),
+            make_stop("mid", 50.0, -2.0),
+            make_stop("end", 100.0, 1.0),
+        ];
+
+        let results = project_stops(&route_line, &stops, None).unwrap();
+        assert_eq!(results.len(), 3);
+        assert!((results[0].distance_along_route - 0.0).abs() < 1e-9);
+        assert!((results[1].distance_along_route - 50.0).abs() < 1e-9);
+        assert!((results[2].distance_along_route - 100.0).abs() < 1e-9);
+        assert!((results[1].projection_error - 2.0).abs() < 1e-9);
     }
 
     #[test]
@@ -248,17 +318,23 @@ mod tests {
             Coord { x: 100.0, y: 0.0 },
             Coord { x: 0.0, y: 0.0 },
         ]);
+
         let stops = vec![
-            make_stop("1", 99.0, 2.0),
-            make_stop("2", 201.0, -1.0),
-            make_stop("3", 101.0, -2.0),
+            make_stop("start", 0.0, 1.0),
+            make_stop("outbound", 99.0, 2.0),
+            make_stop("turnaround", 201.0, -1.0),
+            make_stop("inbound", 101.0, -2.0),
+            make_stop("end", 0.0, -1.0),
         ];
 
         let results = project_stops(&route_line, &stops, None).unwrap();
-        assert_eq!(results.len(), 3);
-        assert!((results[0].distance_along_route - 99.0).abs() < 1e-9);
-        assert!((results[1].distance_along_route - 200.0).abs() < 1e-9);
-        assert!((results[2].distance_along_route - 299.0).abs() < 1e-9);
+
+        assert_eq!(results.len(), 5);
+        assert!((results[0].distance_along_route - 0.0).abs() < 1e-9); // Anchored start
+        assert!((results[1].distance_along_route - 99.0).abs() < 1e-9); // Intermediate outbound
+        assert!((results[2].distance_along_route - 200.0).abs() < 1e-9); // Intermediate turnaround
+        assert!((results[3].distance_along_route - 299.0).abs() < 1e-9); // Intermediate inbound
+        assert!((results[4].distance_along_route - 400.0).abs() < 1e-9); // Anchored end
     }
 
     #[test]
@@ -270,7 +346,8 @@ mod tests {
             Err(ProjectionError::RouteIsEmpty)
         );
 
-        let valid_route = LineString::from(vec![Coord { x: 0.0, y: 0.0 }, Coord { x: 1.0, y: 1.0 }]);
+        let valid_route =
+            LineString::from(vec![Coord { x: 0.0, y: 0.0 }, Coord { x: 1.0, y: 1.0 }]);
         let no_stops = vec![];
         assert_eq!(
             project_stops(&valid_route, &no_stops, None),
@@ -286,13 +363,15 @@ mod tests {
             Coord { x: 100.0, y: 100.0 },
         ]);
         let stops = vec![
-            make_stop("A", 50.0, -1.0),
+            make_stop("A", 0.0, 1.0),
             make_stop("B", 101.0, 50.0),
+            make_stop("C", 100.0, 99.0),
         ];
 
         let results = project_stops(&route_line, &stops, None).unwrap();
-        assert_eq!(results.len(), 2);
-        assert!((results[0].distance_along_route - 50.0).abs() < 1e-9);
+        assert_eq!(results.len(), 3);
+        assert!((results[0].distance_along_route - 0.0).abs() < 1e-9);
         assert!((results[1].distance_along_route - 150.0).abs() < 1e-9);
+        assert!((results[2].distance_along_route - 200.0).abs() < 1e-9);
     }
 }
