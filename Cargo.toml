@@ -1,6 +1,6 @@
 [package]
 name = "route-snapper"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "A Rust library to accurately project an ordered list of stops onto a route line, intelligently handling cases where the route overlaps itself."
 license = "MIT"
